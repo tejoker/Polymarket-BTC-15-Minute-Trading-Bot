@@ -42,6 +42,7 @@ import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
+from core.math.sigmoid import calculate_sigmoid_confidence
 from core.strategy_brain.signal_processors.base_processor import (
     BaseSignalProcessor,
     TradingSignal,
@@ -90,9 +91,11 @@ class DeribitPCRProcessor(BaseSignalProcessor):
             f"max_dte={max_days_to_expiry}d"
         )
 
-    def _get_client(self) -> httpx.Client:
-        """Return a synchronous httpx client (safe inside NautilusTrader's event loop)."""
-        return httpx.Client(timeout=8.0)
+    def __init_async_client(self):
+        """Lazy-init persistent async client."""
+        if not hasattr(self, '_async_client') or self._async_client is None or self._async_client.is_closed:
+            self._async_client = httpx.AsyncClient(timeout=8.0)
+        return self._async_client
 
     def _parse_dte(self, instrument_name: str) -> Optional[int]:
         """
@@ -111,16 +114,16 @@ class DeribitPCRProcessor(BaseSignalProcessor):
         except Exception:
             return None
 
-    def _fetch_pcr(self) -> Optional[Dict]:
-        """Fetch and compute PCR from Deribit synchronously."""
+    async def _fetch_pcr(self) -> Optional[Dict]:
+        """Fetch and compute PCR from Deribit asynchronously."""
         try:
-            with self._get_client() as client:
-                resp = client.get(
-                    DERIBIT_URL,
-                    params={"currency": "BTC", "kind": "option"},
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            client = self.__init_async_client()
+            resp = await client.get(
+                DERIBIT_URL,
+                params={"currency": "BTC", "kind": "option"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
             summaries = data.get("result", [])
             if not summaries:
@@ -188,13 +191,13 @@ class DeribitPCRProcessor(BaseSignalProcessor):
             logger.warning(f"Deribit PCR fetch failed: {e}")
             return None
 
-    def process(
+    async def process(
         self,
         current_price: Decimal,
         historical_prices: list,
         metadata: Dict[str, Any] = None,
     ) -> Optional[TradingSignal]:
-        """Synchronous wrapper — runs async fetch if cache is stale."""
+        """Async fetch with cache."""
         if not self.is_enabled:
             return None
 
@@ -214,7 +217,7 @@ class DeribitPCRProcessor(BaseSignalProcessor):
             )
         else:
             try:
-                pcr_data = self._fetch_pcr()
+                pcr_data = await self._fetch_pcr()
             except Exception as e:
                 logger.warning(f"DeribitPCR fetch failed: {e}")
                 return None
@@ -240,7 +243,14 @@ class DeribitPCRProcessor(BaseSignalProcessor):
             # High PCR = excessive put buying = FEAR = contrarian BULLISH
             direction = SignalDirection.BULLISH
             extremeness = (pcr - self.bullish_pcr_threshold) / self.bullish_pcr_threshold
-            confidence = min(0.80, 0.57 + extremeness * 0.15)
+            
+            confidence = calculate_sigmoid_confidence(
+                extremeness=extremeness,
+                steepness=5.0,
+                midpoint=0.3,
+                max_confidence=0.85,
+                min_confidence_floor=self.min_confidence
+            )
 
             if pcr >= 1.60:
                 strength = SignalStrength.VERY_STRONG
@@ -258,7 +268,14 @@ class DeribitPCRProcessor(BaseSignalProcessor):
             # Low PCR = excessive call buying = GREED = contrarian BEARISH
             direction = SignalDirection.BEARISH
             extremeness = (self.bearish_pcr_threshold - pcr) / self.bearish_pcr_threshold
-            confidence = min(0.80, 0.57 + extremeness * 0.15)
+            
+            confidence = calculate_sigmoid_confidence(
+                extremeness=extremeness,
+                steepness=5.0,
+                midpoint=0.3,
+                max_confidence=0.85,
+                min_confidence_floor=self.min_confidence
+            )
 
             if pcr <= 0.45:
                 strength = SignalStrength.VERY_STRONG

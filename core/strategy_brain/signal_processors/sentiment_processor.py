@@ -11,6 +11,8 @@ import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
+from core.math.sigmoid import calculate_sigmoid_confidence
+
 
 from core.strategy_brain.signal_processors.base_processor import (
     BaseSignalProcessor,
@@ -92,15 +94,21 @@ class SentimentProcessor(BaseSignalProcessor):
             # More extreme = stronger signal
             extremeness = (self.extreme_fear - sentiment_score) / self.extreme_fear
             
+            # SOTA Non-linear probability scaling
+            confidence = calculate_sigmoid_confidence(
+                extremeness=extremeness,
+                steepness=8.0,
+                midpoint=0.5,
+                max_confidence=0.90,
+                min_confidence_floor=self.min_confidence
+            )
+            
             if extremeness >= 0.8:  # Very extreme
                 strength = SignalStrength.VERY_STRONG
-                confidence = 0.85
             elif extremeness >= 0.5:
                 strength = SignalStrength.STRONG
-                confidence = 0.75
             else:
                 strength = SignalStrength.MODERATE
-                confidence = 0.65
             
             logger.info(
                 f"Extreme fear detected: score={sentiment_score:.1f} "
@@ -115,15 +123,20 @@ class SentimentProcessor(BaseSignalProcessor):
             # More extreme = stronger signal
             extremeness = (sentiment_score - self.extreme_greed) / (100 - self.extreme_greed)
             
+            confidence = calculate_sigmoid_confidence(
+                extremeness=extremeness,
+                steepness=8.0,
+                midpoint=0.5,
+                max_confidence=0.90,
+                min_confidence_floor=self.min_confidence
+            )
+            
             if extremeness >= 0.8:
                 strength = SignalStrength.VERY_STRONG
-                confidence = 0.85
             elif extremeness >= 0.5:
                 strength = SignalStrength.STRONG
-                confidence = 0.75
             else:
                 strength = SignalStrength.MODERATE
-                confidence = 0.65
             
             logger.info(
                 f"Extreme greed detected: score={sentiment_score:.1f} "

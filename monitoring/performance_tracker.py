@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from collections import deque
 from loguru import logger
 
+from core.math.psr import ProbabilisticSharpeRatio
+
 
 @dataclass
 class Trade:
@@ -61,6 +63,10 @@ class PerformanceMetrics:
     # Signal performance
     avg_signal_score: float
     avg_signal_confidence: float
+
+    # PSR analytics
+    psr_probability: float = 0.0
+    psr_significant: bool = False
 
 
 class PerformanceTracker:
@@ -211,8 +217,8 @@ class PerformanceTracker:
         # Return metrics
         roi = float((self.current_capital - self.initial_capital) / self.initial_capital)
         
-        # Sharpe ratio (simplified - uses daily returns)
-        sharpe = self._calculate_sharpe_ratio()
+        # Sharpe ratio via PSR (15-min intervals, not daily)
+        sharpe, psr_prob, psr_sig = self._calculate_sharpe_ratio()
         
         # Max drawdown
         max_dd = float((self._peak_capital - self.current_capital) / self._peak_capital) if self._peak_capital > 0 else 0.0
@@ -249,6 +255,8 @@ class PerformanceTracker:
             risk_utilization=0.0,
             avg_signal_score=avg_score,
             avg_signal_confidence=avg_conf,
+            psr_probability=psr_prob,
+            psr_significant=psr_sig,
         )
         
         # Cache metrics
@@ -260,38 +268,30 @@ class PerformanceTracker:
         
         return metrics
     
-    def _calculate_sharpe_ratio(self, risk_free_rate: float = 0.02) -> float:
+    def _calculate_sharpe_ratio(self, risk_free_rate: float = 0.02) -> tuple[float, float, bool]:
         """
-        Calculate Sharpe ratio.
-        
-        Args:
-            risk_free_rate: Annual risk-free rate (default 2%)
-            
+        Calculate Sharpe ratio using Probabilistic Sharpe Ratio (PSR).
+
+        Uses 35040 periods/year (15-min intervals) instead of the incorrect
+        252 daily trading days. Also returns PSR probability and significance.
+
         Returns:
-            Sharpe ratio
+            (annualized_sharpe, psr_probability, psr_significant)
         """
         if len(self._trades) < 2:
-            return 0.0
-        
-        # Get daily returns
+            return 0.0, 0.0, False
+
         returns = [float(t.pnl / t.size) for t in self._trades if t.size > 0]
-        
+
         if not returns:
-            return 0.0
-        
-        # Calculate mean and std
-        mean_return = sum(returns) / len(returns)
-        variance = sum((r - mean_return) ** 2 for r in returns) / len(returns)
-        std_return = variance ** 0.5
-        
-        if std_return == 0:
-            return 0.0
-        
-        # Sharpe = (mean return - risk free) / std
-        # Annualize assuming 252 trading days
-        sharpe = (mean_return - risk_free_rate / 252) / std_return * (252 ** 0.5)
-        
-        return sharpe
+            return 0.0, 0.0, False
+
+        psr_calc = ProbabilisticSharpeRatio(
+            benchmark_sharpe=0.0,
+            periods_per_year=35040,
+        )
+        ann_sr, psr_prob, is_significant = psr_calc.calculate_psr(returns)
+        return ann_sr, psr_prob, is_significant
     
     def get_trade_history(
         self,

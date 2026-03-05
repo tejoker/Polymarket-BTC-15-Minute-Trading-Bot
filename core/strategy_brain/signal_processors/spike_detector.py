@@ -21,6 +21,9 @@ import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
+from core.math.welford import WelfordRollingStat
+from core.math.evt import ExtremeValueDetector
+
 
 from core.strategy_brain.signal_processors.base_processor import (
     BaseSignalProcessor,
@@ -61,6 +64,10 @@ class SpikeDetectionProcessor(BaseSignalProcessor):
         self.min_confidence = min_confidence
         self.velocity_threshold = velocity_threshold
 
+        # 2026 SOTA Math Layers
+        self.welford = WelfordRollingStat(window_size=lookback_periods)
+        self.evt_detector = ExtremeValueDetector(baseline_threshold=3.0, expected_shape=0.20)
+
         logger.info(
             f"Initialized Spike Detector (FIXED): "
             f"deviation_threshold={spike_threshold:.1%}, "
@@ -84,9 +91,10 @@ class SpikeDetectionProcessor(BaseSignalProcessor):
             return None
 
         # --- Compute 20-period MA ---
-        recent = historical_prices[-self.lookback_periods:]
-        ma = sum(float(p) for p in recent) / len(recent)
+        # Welford Online Variance / Mean
         curr = float(current_price)
+        self.welford.update(curr)
+        ma = self.welford.mean
 
         deviation = (curr - ma) / ma if ma > 0 else 0.0
         deviation_abs = abs(deviation)
@@ -103,9 +111,12 @@ class SpikeDetectionProcessor(BaseSignalProcessor):
         )
 
         # =====================================================================
-        # SIGNAL 1: MA DEVIATION SPIKE → mean reversion
+        # SIGNAL 1: MA DEVIATION SPIKE → mean reversion via EVT
         # =====================================================================
-        if deviation_abs >= self.spike_threshold:
+        is_spike, evt_confidence = self.evt_detector.is_extreme(curr, self.welford)
+        
+        # Maintain legacy deviation fallback but prioritize EVT
+        if is_spike or deviation_abs >= self.spike_threshold:
             logger.info(
                 f"MA deviation spike: {deviation:+.3%} from MA "
                 f"(${curr:.4f} vs MA={ma:.4f})"
@@ -125,7 +136,9 @@ class SpikeDetectionProcessor(BaseSignalProcessor):
             else:
                 strength = SignalStrength.WEAK
 
-            confidence = min(0.90, 0.50 + (deviation_abs - self.spike_threshold) * 3.0)
+            # Use EVT confidence instead of linear clamp if triggered by EVT
+            # Otherwise use the magnitude derivation
+            confidence = max(self.min_confidence, min(0.95, evt_confidence if evt_confidence > 0 else 0.50 + (deviation_abs) * 2.0))
 
             if confidence < self.min_confidence:
                 return None

@@ -8,6 +8,9 @@ from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 from loguru import logger
 
+from core.math.welford import WelfordRollingStat
+from core.math.evt import ExtremeValueDetector
+
 
 @dataclass
 class ValidationRule:
@@ -42,6 +45,10 @@ class DataValidator:
         # Price history for anomaly detection
         self._price_history: Dict[str, List[Decimal]] = {}
         self._max_history_size = 100
+
+        # Welford rolling stats and EVT detector per source (replaces naive Z-score)
+        self._welford_stats: Dict[str, WelfordRollingStat] = {}
+        self._evt_detector = ExtremeValueDetector(baseline_threshold=3.0, expected_shape=0.2)
         
         # Validation rules
         self.btc_rules = {
@@ -149,12 +156,17 @@ class DataValidator:
         # Update price history
         if source not in self._price_history:
             self._price_history[source] = []
-        
+
         self._price_history[source].append(price)
-        
+
         # Limit history size
         if len(self._price_history[source]) > self._max_history_size:
             self._price_history[source].pop(0)
+
+        # Feed Welford rolling stats for EVT anomaly detection
+        if source not in self._welford_stats:
+            self._welford_stats[source] = WelfordRollingStat(window_size=self._max_history_size)
+        self._welford_stats[source].update(float(price))
         
         # Build result
         is_valid = len(errors) == 0
@@ -218,46 +230,40 @@ class DataValidator:
         z_score_threshold: float = 3.0,
     ) -> Optional[Dict[str, Any]]:
         """
-        Detect price anomalies using Z-score.
-        
+        Detect price anomalies using EVT (Extreme Value Theory) with Welford
+        online statistics, replacing the naive Gaussian Z-score approach.
+
         Args:
             source: Data source
             current_price: Current price to check
-            z_score_threshold: Z-score threshold for anomaly
-            
+            z_score_threshold: Baseline threshold (passed to EVT detector)
+
         Returns:
             Anomaly details if detected, None otherwise
         """
-        if source not in self._price_history:
+        if source not in self._welford_stats:
             return None
-        
-        history = self._price_history[source]
-        
-        if len(history) < 10:  # Need enough data
+
+        welford = self._welford_stats[source]
+
+        if welford._count < 10:
             return None
-        
-        # Calculate mean and std dev
-        mean = sum(history) / len(history)
-        variance = sum((x - mean) ** 2 for x in history) / len(history)
-        std_dev = Decimal(str(float(variance) ** 0.5))
-        
-        if std_dev == 0:
-            return None
-        
-        # Calculate Z-score
-        z_score = abs((current_price - mean) / std_dev)
-        
-        if float(z_score) > z_score_threshold:
+
+        is_extreme, adjusted_confidence = self._evt_detector.is_extreme(
+            float(current_price), welford
+        )
+
+        if is_extreme:
             return {
                 "source": source,
                 "current_price": float(current_price),
-                "mean_price": float(mean),
-                "std_dev": float(std_dev),
-                "z_score": float(z_score),
+                "mean_price": welford.mean,
+                "std_dev": welford.std_dev,
+                "evt_confidence": adjusted_confidence,
                 "threshold": z_score_threshold,
-                "anomaly_type": "price_spike" if current_price > mean else "price_drop",
+                "anomaly_type": "price_spike" if float(current_price) > welford.mean else "price_drop",
             }
-        
+
         return None
     
     def get_price_statistics(self, source: str) -> Optional[Dict[str, Any]]:

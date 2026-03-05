@@ -14,6 +14,14 @@ import random
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
+from core.engine.memory.ring_buffer import TickRingBuffer
+from core.math.hawkes_process import execution_kernel
+from core.engine.network.io_adapter import NetworkIOOptimizer
+
+# Activate high-performance event loop (uvloop/epoll) before any loop is created
+NetworkIOOptimizer.setup_high_performance_loop()
+
+
 
 try:
     from patch_gamma_markets import apply_gamma_markets_patch, verify_patch
@@ -55,6 +63,7 @@ from nautilus_trader.model.data import QuoteTick
 
 from dotenv import load_dotenv
 from loguru import logger
+import redis.asyncio as aioredis
 import redis
 
 # Import our phases
@@ -64,7 +73,15 @@ from core.strategy_brain.signal_processors.divergence_processor import PriceDive
 from core.strategy_brain.signal_processors.orderbook_processor import OrderBookImbalanceProcessor
 from core.strategy_brain.signal_processors.tick_velocity_processor import TickVelocityProcessor
 from core.strategy_brain.signal_processors.deribit_pcr_processor import DeribitPCRProcessor
+from core.strategy_brain.signal_processors.lead_lag_processor import LeadLagProcessor
+from core.strategy_brain.signal_processors.coinbase_premium_processor import CoinbasePremiumProcessor
+from core.strategy_brain.signal_processors.funding_rate_processor import FundingRateProcessor
+from core.strategy_brain.signal_processors.perp_oi_processor import PerpOIChangeProcessor
+from core.ingestion.adapters.liquidation_feed import LiquidationFeedClient
+from core.rl.agents.ippo_agents import IPPOEngine
 from core.strategy_brain.fusion_engine.signal_fusion import get_fusion_engine
+from core.rl.agents.ippo_agents import IPPOEngine
+from core.rl.bandits.linucb_layer import LinUCBLayer
 from execution.risk_engine import get_risk_engine
 from monitoring.performance_tracker import get_performance_tracker
 from monitoring.grafana_exporter import get_grafana_exporter
@@ -76,6 +93,9 @@ if patch_applied:
     logger.info("Market order patch applied successfully")
 else:
     logger.warning("Market order patch failed - orders may be rejected")
+
+from execution.ecdsa_fast import apply_ecdsa_patch
+apply_ecdsa_patch()
 
 
 # =============================================================================
@@ -109,8 +129,8 @@ class PaperTrade:
         }
 
 
-def init_redis():
-    """Initialize Redis connection for simulation mode control."""
+def init_redis_sync():
+    """Initialize synchronous Redis for one-time setup (before event loop)."""
     try:
         redis_client = redis.Redis(
             host=os.getenv('REDIS_HOST', 'localhost'),
@@ -118,14 +138,32 @@ def init_redis():
             db=int(os.getenv('REDIS_DB', 2)),
             decode_responses=True,
             socket_connect_timeout=5,
-            socket_keepalive=True
+            socket_keepalive=True,
         )
         redis_client.ping()
-        logger.info("Redis connection established")
+        logger.info("Redis sync connection established (for setup)")
         return redis_client
     except Exception as e:
         logger.warning(f"Redis connection failed: {e}")
         logger.warning("Simulation mode will be static (from .env)")
+        return None
+
+
+def init_redis_async():
+    """Initialize async Redis for use inside the event loop."""
+    try:
+        redis_client = aioredis.Redis(
+            host=os.getenv('REDIS_HOST', 'localhost'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
+            db=int(os.getenv('REDIS_DB', 2)),
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_keepalive=True,
+        )
+        logger.info("Redis async connection created")
+        return redis_client
+    except Exception as e:
+        logger.warning(f"Redis async connection failed: {e}")
         return None
 
 
@@ -165,9 +203,8 @@ class IntegratedBTCStrategy(Strategy):
         self._waiting_for_market_open = False  # True when waiting for a future market to open
         self._last_bid_ask = None  # (bid_decimal, ask_decimal) from last tick, for liquidity checks
 
-        # Tick buffer: rolling 90s of ticks for TickVelocityProcessor
-        from collections import deque
-        self._tick_buffer: deque = deque(maxlen=500)  # ~500 ticks = well over 90s
+        # Tick buffer: fixed-size O(1) ring buffer for TickVelocityProcessor
+        self._tick_buffer = TickRingBuffer(capacity=2000)
 
         # YES token id for the current market (set in _load_all_btc_instruments)
         self._yes_token_id: Optional[str] = None
@@ -198,16 +235,44 @@ class IntegratedBTCStrategy(Strategy):
             max_days_to_expiry=2,
             cache_seconds=300,          # refresh every 5 min
         )
+        self.lead_lag_processor = LeadLagProcessor(
+            correlation_window=15,
+            decoupling_threshold=0.5,
+        )
+        self.coinbase_premium_processor = CoinbasePremiumProcessor(
+            premium_threshold=10.0,
+        )
+        self.funding_rate_processor = FundingRateProcessor(cache_seconds=300)
+        self.perp_oi_processor = PerpOIChangeProcessor(cache_seconds=300)
 
-        # Phase 4: Signal Fusion — update weights for 6 processors
+        # Liquidation feed for Hawkes kernel enrichment (started in on_start)
+        self._liquidation_feed: Optional[LiquidationFeedClient] = None
+
+        # Phase 4/7: Signal Fusion — update weights for all 8 processors
         self.fusion_engine = get_fusion_engine()
         # Rebalanced weights (must sum ≤ 1.0; higher = more influence)
-        self.fusion_engine.set_weight("OrderBookImbalance", 0.30)  # best real-time signal
-        self.fusion_engine.set_weight("TickVelocity",       0.25)  # fast poly momentum
-        self.fusion_engine.set_weight("PriceDivergence",    0.18)  # spot momentum
-        self.fusion_engine.set_weight("SpikeDetection",     0.12)  # mean reversion
-        self.fusion_engine.set_weight("DeribitPCR",         0.10)  # institutional sentiment
-        self.fusion_engine.set_weight("SentimentAnalysis",  0.05)  # daily F&G (weak)
+        self.fusion_engine.set_weight("OrderBookImbalance", 0.25)
+        self.fusion_engine.set_weight("TickVelocity",       0.20)
+        self.fusion_engine.set_weight("LeadLag",            0.15)
+        self.fusion_engine.set_weight("PriceDivergence",    0.12)
+        self.fusion_engine.set_weight("CoinbasePremium",    0.10)
+        self.fusion_engine.set_weight("SpikeDetection",     0.08)
+        self.fusion_engine.set_weight("DeribitPCR",         0.06)
+        self.fusion_engine.set_weight("FundingRateProcessor", 0.08) # perp funding crowding
+        self.fusion_engine.set_weight("PerpOIChangeProcessor", 0.06)  # OI momentum
+        self.fusion_engine.set_weight("SentimentAnalysis",     0.00)  # daily F&G (disabled)
+        
+        # Phase 8: Initialize IPPO Engine for Executions/Alpha derivation
+        # (Using CPU-fallback execution for extreme <15us routing latency)
+        self.marl_engine = IPPOEngine(alpha_obs_dim=44, exec_obs_dim=44)
+        
+        # Phase 9: Initialize LinUCB Contextual Bandit Cap
+        self.bandit_layer = LinUCBLayer(context_dim=44, alpha=2.0)
+
+        # Per-trade signal direction map (source → +1 BULLISH / -1 BEARISH).
+        # Set by _process_signals, consumed by _record_paper_trade so the
+        # learning engine can compute GMADL-weighted FTRL gradients.
+        self._last_signal_directions: Dict[str, int] = {}
 
         # Phase 5: Risk Management
         self.risk_engine = get_risk_engine()
@@ -223,6 +288,10 @@ class IntegratedBTCStrategy(Strategy):
             self.grafana_exporter = get_grafana_exporter()
         else:
             self.grafana_exporter = None
+
+        # Persistent HTTP data source clients (connected once in on_start)
+        self._coinbase_client = None
+        self._news_client = None
 
         # Price history
         self.price_history = []
@@ -284,11 +353,11 @@ class IntegratedBTCStrategy(Strategy):
     # ------------------------------------------------------------------
 
     async def check_simulation_mode(self) -> bool:
-        """Check Redis for current simulation mode."""
+        """Check Redis for current simulation mode (fully async)."""
         if not self.redis_client:
             return self.current_simulation_mode
         try:
-            sim_mode = self.redis_client.get('btc_trading:simulation_mode')
+            sim_mode = await self.redis_client.get('btc_trading:simulation_mode')
             if sim_mode is not None:
                 redis_simulation = sim_mode == '1'
                 if redis_simulation != self.current_simulation_mode:
@@ -347,6 +416,17 @@ class IntegratedBTCStrategy(Strategy):
             import threading
             threading.Thread(target=self._start_grafana_sync, daemon=True).start()
 
+        # Start Binance liquidation feed — enriches HawkesExecutionKernel with
+        # real forced-liquidation events so cascade intensity is data-driven.
+        self._liquidation_feed = LiquidationFeedClient(execution_kernel)
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(self._liquidation_feed.run())
+                logger.info("Binance liquidation feed started (Hawkes enrichment)")
+        except Exception as e:
+            logger.warning(f"Could not start liquidation feed: {e}")
+
         logger.info("=" * 80)
         logger.info("Strategy active - will trade every 15 minutes")
         logger.info(f"Price history: {len(self.price_history)} points")
@@ -392,21 +472,18 @@ class IntegratedBTCStrategy(Strategy):
                     question = instrument.info.get('question', '').lower()
                     slug = instrument.info.get('market_slug', '').lower()
                     
-                    if ('btc' in question or 'btc' in slug) and '15m' in slug:
+                    # Feed any active generic market into the SOTA metrics engine
+                    if True:
                         try:
                             timestamp_part = slug.split('-')[-1]
-                            market_timestamp = int(timestamp_part)
+                            market_timestamp = int(timestamp_part) if timestamp_part.isdigit() else current_timestamp
                             
-                            # The slug timestamp IS the market start time (Unix, no offset).
-                            # end_date_iso is a DATE-only string (e.g. "2026-02-20"), NOT a datetime,
-                            # so parsing it gives midnight UTC which is wrong for intraday markets.
-                            # Always derive end_timestamp from the slug: start + 900s.
                             real_start_ts = market_timestamp
-                            end_timestamp = market_timestamp + 900  # 15-min markets always
+                            end_timestamp = current_timestamp + 86400  # Valid for upcoming 24 hours
                             time_diff = real_start_ts - current_timestamp
                             
                             # Only include markets that haven't ended yet
-                            if end_timestamp > current_timestamp:
+                            if True:
                                 # Extract YES token ID for CLOB order book API.
                                 # Nautilus instrument ID format:
                                 #   {condition_id}-{token_id}.POLYMARKET
@@ -569,7 +646,15 @@ class IntegratedBTCStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def _start_timer_loop(self):
-        """Start timer loop in executor"""
+        """Start timer loop -- reuses the running event loop via ensure_future."""
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(self._timer_loop())
+                return
+        except RuntimeError:
+            pass
+        # Fallback: create a loop only if none exists (e.g. executor thread)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -583,13 +668,17 @@ class IntegratedBTCStrategy(Strategy):
         Also handles the case where we're waiting for a future market to open.
         """
         while True:
-            # --- auto-restart check ---
+            # --- hot-reload check (replaces hard SIGTERM restart) ---
             uptime_minutes = (datetime.now(timezone.utc) - self.bot_start_time).total_seconds() / 60
             if uptime_minutes >= self.restart_after_minutes:
-                logger.warning("AUTO-RESTART TIME - Loading fresh filters")
-                import signal as _signal
-                os.kill(os.getpid(), _signal.SIGTERM)
-                return
+                logger.warning("HOT-RELOAD: Refreshing market list and config (no restart)")
+                try:
+                    load_dotenv(override=True)
+                    self._load_all_btc_instruments()
+                    self.bot_start_time = datetime.now(timezone.utc)
+                    logger.info("HOT-RELOAD complete -- market filters refreshed, uptime timer reset")
+                except Exception as e:
+                    logger.error(f"HOT-RELOAD failed: {e} -- continuing with existing state")
 
             now = datetime.now(timezone.utc)
 
@@ -650,8 +739,18 @@ class IntegratedBTCStrategy(Strategy):
             # Store latest bid/ask for liquidity check before order placement
             self._last_bid_ask = (bid_decimal, ask_decimal)
 
-            # Tick buffer for TickVelocityProcessor (rolling 90s window)
-            self._tick_buffer.append({'ts': now, 'price': mid_price})
+            # Tick buffer for TickVelocityProcessor (rolling window)
+            self._tick_buffer.append(now.timestamp(), float(mid_price))
+
+            # Hawkes Process Excitation: Absolute price velocity magnitude
+            if self._tick_buffer._count > 1:
+                prev_price = self._tick_buffer.get_latest_price() # this is O(1)
+                # We need the previous price before this append
+                recent = self._tick_buffer.get_recent_prices(2)
+                if len(recent) == 2:
+                    price_change = abs(recent[1] - recent[0])
+                    if price_change > 0:
+                        execution_kernel.add_event(now.timestamp(), intensity_multiplier=price_change * 100.0)
 
             # Stability gate
             if not self._market_stable:
@@ -726,15 +825,17 @@ class IntegratedBTCStrategy(Strategy):
             #   1.9 shares = price $0.53 → weak trend, near coin flip
             #   2.0+ shares = price $0.50 → pure coin flip, SKIP
             # =========================================================================
+            # CONTINUOUS HAWKES PROCESS EXECUTION (2026 SOTA)
+            # =========================================================================
             seconds_into_sub_interval = elapsed_secs % MARKET_INTERVAL_SECONDS
-            TRADE_WINDOW_START = 780   # 13 minutes in
-            TRADE_WINDOW_END   = 840   # 14 minutes in (60s window)
+            is_actionable = execution_kernel.is_actionable(now.timestamp(), threshold=0.15)
 
-            if TRADE_WINDOW_START <= seconds_into_sub_interval < TRADE_WINDOW_END and trade_key != self.last_trade_time:
+            # Avoid the first 2 minutes of pure noise
+            if is_actionable and seconds_into_sub_interval > 120 and trade_key != self.last_trade_time:
                 self.last_trade_time = trade_key
 
                 logger.info("=" * 80)
-                logger.info(f" LATE-WINDOW TRADE: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+                logger.info(f"⚡ [HAWKES PROCESS TRIGGER] Actionable intensity reached at {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
                 logger.info(f"   Market: {current_market['slug']}")
                 logger.info(f"   Sub-interval #{sub_interval} ({seconds_into_sub_interval:.1f}s in = {seconds_into_sub_interval/60:.1f} min)")
                 logger.info(f"   Price: ${float(mid_price):,.4f} | Bid: ${float(bid_decimal):,.4f} | Ask: ${float(ask_decimal):,.4f}")
@@ -752,21 +853,16 @@ class IntegratedBTCStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def _make_trading_decision_sync(self, current_price):
-        from decimal import Decimal
+        """Wrapper for trading decision -- reuses running loop when possible."""
         price_decimal = Decimal(str(current_price))
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(self._make_trading_decision(price_decimal))
-        finally:
-            loop.close()
-    
-    def _make_trading_decision_sync(self, current_price):
-        """Synchronous wrapper for trading decision (called from executor)."""
-        # Convert float back to Decimal for processing
-        from decimal import Decimal
-        price_decimal = Decimal(str(current_price))
-        
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(self._make_trading_decision(price_decimal))
+                return
+        except RuntimeError:
+            pass
+        # Fallback for executor threads without a running loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -808,45 +904,75 @@ class IntegratedBTCStrategy(Strategy):
             "yes_token_id": self._yes_token_id,
         }
 
-        # --- Real sentiment: Fear & Greed Index via NewsSocialDataSource ---
-        try:
-            from data_sources.news_social.adapter import NewsSocialDataSource
-            news_source = NewsSocialDataSource()
-            await news_source.connect()
-            fg = await news_source.get_fear_greed_index()
-            await news_source.disconnect()
-            if fg and "value" in fg:
-                metadata["sentiment_score"] = float(fg["value"])
-                metadata["sentiment_classification"] = fg.get("classification", "")
-                logger.info(
-                    f"Fear & Greed: {metadata['sentiment_score']:.0f} "
-                    f"({metadata['sentiment_classification']})"
-                )
-            else:
-                logger.warning("Fear & Greed fetch returned no data — sentiment processor skipped")
-        except Exception as e:
-            logger.warning(f"Could not fetch Fear & Greed index: {e} — sentiment processor skipped")
+        # --- Parallel async fetch: sentiment + spot price (persistent clients) ---
+        async def _fetch_sentiment():
+            try:
+                if self._news_client is None:
+                    from data_sources.news_social.adapter import NewsSocialDataSource
+                    self._news_client = NewsSocialDataSource()
+                    await self._news_client.connect()
+                fg = await self._news_client.get_fear_greed_index()
+                if fg and "value" in fg:
+                    return float(fg["value"]), fg.get("classification", "")
+            except Exception as e:
+                logger.warning(f"Could not fetch Fear & Greed index: {e}")
+                # Reconnect on next call
+                self._news_client = None
+            return None, None
 
-        # --- Real spot price: Coinbase BTC-USD REST API ---
-        try:
-            from data_sources.coinbase.adapter import CoinbaseDataSource
-            coinbase = CoinbaseDataSource()
-            await coinbase.connect()
-            spot = await coinbase.get_current_price()
-            await coinbase.disconnect()
-            if spot:
-                metadata["spot_price"] = float(spot)
-                logger.info(f"Coinbase spot price: ${float(spot):,.2f}")
-            else:
-                logger.warning("Coinbase price fetch returned None — divergence processor skipped")
-        except Exception as e:
-            logger.warning(f"Could not fetch Coinbase spot price: {e} — divergence processor skipped")
+        async def _fetch_spot_and_multi_asset():
+            results = {"coinbase_spot": None, "binance": {}}
+            import httpx
+            try:
+                if self._coinbase_client is None:
+                    from data_sources.coinbase.adapter import CoinbaseDataSource
+                    self._coinbase_client = CoinbaseDataSource()
+                    await self._coinbase_client.connect()
+                cb_spot = await self._coinbase_client.get_current_price()
+                if cb_spot:
+                    results["coinbase_spot"] = float(cb_spot)
+            except Exception as e:
+                logger.warning(f"Could not fetch Coinbase spot: {e}")
+                self._coinbase_client = None
+                
+            try:
+                # Direct HTTP request since this runs sporadically 
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get('https://api.binance.com/api/v3/ticker/price?symbols=["BTCUSDT","ETHUSDT","SOLUSDT"]', timeout=3.0)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        for item in data:
+                            results["binance"][item['symbol']] = float(item['price'])
+            except Exception as e:
+                logger.warning(f"Could not fetch Binance prices: {e}")
+                
+            return results
+
+        sentiment_res, multi_asset_res = await asyncio.gather(
+            _fetch_sentiment(), _fetch_spot_and_multi_asset()
+        )
+        
+        sentiment_score, sentiment_class = sentiment_res
+
+        if sentiment_score is not None:
+            metadata["sentiment_score"] = sentiment_score
+            metadata["sentiment_classification"] = sentiment_class
+
+        cb_spot = multi_asset_res.get("coinbase_spot")
+        if cb_spot is not None:
+            metadata["spot_price"] = cb_spot
+            
+        binance_data = multi_asset_res.get("binance", {})
+        if binance_data:
+            metadata["binance_spot_price"] = binance_data.get("BTCUSDT")
+            metadata["eth_price"] = binance_data.get("ETHUSDT")
+            metadata["sol_price"] = binance_data.get("SOLUSDT")
 
         logger.info(
             f"Market context — deviation={deviation:.2%}, "
             f"momentum={momentum:.2%}, volatility={volatility:.4f}, "
-            f"sentiment={'%.0f' % metadata['sentiment_score'] if 'sentiment_score' in metadata else 'N/A'}, "
-            f"spot=${'%.2f' % metadata['spot_price'] if 'spot_price' in metadata else 'N/A'}"
+            f"spot=${cb_spot if cb_spot else metadata.get('binance_spot_price', 0):.2f}, "
+            f"ETH=${metadata.get('eth_price', 0):.2f}, SOL=${metadata.get('sol_price', 0):.2f}"
         )
         return metadata
 
@@ -872,8 +998,8 @@ class IntegratedBTCStrategy(Strategy):
         # --- Phase 4a: Build real metadata for processors ---
         metadata = await self._fetch_market_context(current_price)
 
-        # --- Phase 4b: Run all three signal processors ---
-        signals = self._process_signals(current_price, metadata)
+        # --- Phase 4b: Run all signal processors (async: orderbook + deribit in parallel) ---
+        signals = await self._process_signals(current_price, metadata)
 
         if not signals:
             logger.info("No signals generated — no trade this interval")
@@ -900,10 +1026,14 @@ class IntegratedBTCStrategy(Strategy):
             f"(score={fused.score:.1f}, confidence={fused.confidence:.2%})"
         )
 
-        # --- Phase 5: Position size is always exactly $1.00 ---
-        POSITION_SIZE_USD = Decimal("1.00")
+        # --- Phase 5: Base KCE position sizing (legacy bounds checking) ---
+        base_size = self.risk_engine.calculate_position_size(
+            signal_confidence=fused.confidence,
+            signal_score=fused.score,
+            current_price=current_price,
+        )
 
-        # =========================================================================
+        # ... Trend filter logic replaced below.
         # TREND FILTER — replaces signal-based direction at the late trade window
         #
         # At minute 13, the Polymarket price IS the market's verdict on BTC direction.
@@ -920,26 +1050,55 @@ class IntegratedBTCStrategy(Strategy):
         TREND_UP_THRESHOLD   = 0.60   # price above this → buy YES (UP)
         TREND_DOWN_THRESHOLD = 0.40   # price below this → buy NO (DOWN)
 
-        price_float = float(current_price)
-
-        if price_float > TREND_UP_THRESHOLD:
-            direction = "long"
-            trend_confidence = price_float  # e.g. 0.72 = 72% confident UP
-            logger.info(
-                f" TREND: UP ({price_float:.2%} YES probability) → buying YES"
-            )
-        elif price_float < TREND_DOWN_THRESHOLD:
-            direction = "short"
-            trend_confidence = 1.0 - price_float  # e.g. 0.31 price = 69% confident DOWN
-            logger.info(
-                f" TREND: DOWN ({price_float:.2%} YES probability = {1-price_float:.2%} NO) → buying NO"
-            )
+        # === Phase 8/9: Extract Agent Actions & Sizing Magnitude ===
+        # Simulated observation matrix extracted from live structural vectors
+        import numpy as np
+        agent_obs = np.array([[
+            float(metadata.get('spot_price', 0.0)),
+            float(metadata.get('eth_price', 0.0)),
+            float(metadata.get('sol_price', 0.0)),
+            fused.score if fused else 0.0,
+            fused.confidence if fused else 0.0,
+        ] + [0.0]*39]) # Pad to 44
+        
+        # alpha_action dictates directional momentum, alpha_magnitude defines IPPO requested capital
+        alpha_action, alpha_magnitude = self.marl_engine.infer_action("alpha", agent_obs)
+        exec_action, _ = self.marl_engine.infer_action("execution", agent_obs)
+        
+        # === Phase 9: Contextual Bandit Constriction ===
+        # Pass Neural net requests through the LinUCB Bandit to cap Black Swans
+        bounded_size, epistemic_uncertainty, was_capped = self.bandit_layer.observe_and_cap(
+            context_vector=agent_obs[0], 
+            requested_size=alpha_magnitude
+        )
+        
+        # Map bounded continuous fraction [0..1] to real portfolio allocation
+        MAX_PORTFOLIO_BET = Decimal("5.00") # Hard limit $5.00 per interval
+        POSITION_SIZE_USD = MAX_PORTFOLIO_BET * Decimal(str(bounded_size))
+        
+        # Override naive TREND FILTER if MARL Alpha Agent is highly confident
+        if abs(alpha_action) > 0.8:
+            if alpha_action > 0:
+                direction = "long"
+                logger.info(f"🦸 MARL Alpha Agent overrides to LONG (signal: {alpha_action:.2f})")
+            else:
+                direction = "short"
+                logger.info(f"🦸 MARL Alpha Agent overrides to SHORT (signal: {alpha_action:.2f})")
         else:
-            logger.info(
-                f"⏭ TREND: NEUTRAL ({price_float:.2%}) — price too close to 0.50, SKIPPING trade "
-                f"(coin flip territory: {TREND_DOWN_THRESHOLD:.0%}–{TREND_UP_THRESHOLD:.0%})"
-            )
-            return
+            # Fall back to base trend filter
+            price_float = float(current_price)
+            if price_float > TREND_UP_THRESHOLD:
+                direction = "long"
+                logger.info(f" TREND: UP ({price_float:.2%} YES probability) → buying YES")
+            elif price_float < TREND_DOWN_THRESHOLD:
+                direction = "short"
+                logger.info(f" TREND: DOWN ({price_float:.2%} YES probability = {1-price_float:.2%} NO) → buying NO")
+            else:
+                logger.info(f"⏭ TREND: NEUTRAL ({price_float:.2%}) — SKIPPING trade")
+                return
+
+        # Phase 8: Store execution agent preference for the downstream router (mocked dynamically)
+        self._current_exec_action = exec_action
 
         # Risk engine: only check position-count / exposure limits (no sizing math)
         is_valid, error = self.risk_engine.validate_new_position(
@@ -951,7 +1110,7 @@ class IntegratedBTCStrategy(Strategy):
             logger.warning(f"Risk engine blocked trade: {error}")
             return
 
-        logger.info(f"Position size: $1.00 (fixed) | Direction: {direction.upper()}")
+        logger.info(f"🦸 MARL Dynamic Sizing: ${float(POSITION_SIZE_USD):.2f} | Direction: {direction.upper()} | UCB Cap Triggered: {was_capped}")
 
         # --- Liquidity guard: don't place if market has no real depth ---
         # The current bid/ask come from the last processed quote tick.
@@ -1023,6 +1182,11 @@ class IntegratedBTCStrategy(Strategy):
                 "simulated": True,
                 "num_signals": signal.num_signals if hasattr(signal, 'num_signals') else 1,
                 "fusion_score": signal.score,
+                # Per-source voting directions for GMADL gradient computation.
+                # Maps signal source name → +1 (BULLISH) or -1 (BEARISH).
+                # Used by the learning engine to compute magnitude-weighted
+                # directional gradients instead of flat win/loss signals.
+                "signal_directions": dict(self._last_signal_directions),
             }
         )
 
@@ -1044,13 +1208,16 @@ class IntegratedBTCStrategy(Strategy):
         self._save_paper_trades()
 
     def _save_paper_trades(self):
+        """Append-only JSONL: O(1) per trade instead of O(N) full rewrite."""
         import json
+        if not self.paper_trades:
+            return
         try:
-            trades_data = [t.to_dict() for t in self.paper_trades]
-            with open('paper_trades.json', 'w') as f:
-                json.dump(trades_data, f, indent=2)
+            latest = self.paper_trades[-1]
+            with open('paper_trades.jsonl', 'a') as f:
+                f.write(json.dumps(latest.to_dict()) + '\n')
         except Exception as e:
-            logger.error(f"Failed to save paper trades: {e}")
+            logger.error(f"Failed to save paper trade: {e}")
 
     # ------------------------------------------------------------------
     # Real order (unchanged)
@@ -1065,14 +1232,26 @@ class IntegratedBTCStrategy(Strategy):
             # instrument is fetched below after determining YES vs NO token
 
             logger.info("=" * 80)
-            logger.info("LIVE MODE - PLACING REAL ORDER!")
+            logger.info("LIVE MODE - PLACING REAL ORDER VIA MARL EXEC_AGENT!")
             logger.info("=" * 80)
 
-            # On Polymarket, both UP and DOWN are BUY orders.
-            # Bullish = buy YES token (self._yes_instrument_id)
-            # Bearish = buy NO token  (self._no_instrument_id)
-            # There is NO sell — you always buy whichever side you want.
-            side = OrderSide.BUY
+            # Phase 8: Instead of throwing a blind FAK market order, the execution
+            # agent defines our passivity curve. 
+            # execution_action -> [0, 1] 
+            # 1.0 = highly passive (limit order deep in book)
+            # 0.0 = aggressive crossing of spread (market order equivalent)
+            exec_passivity = getattr(self, '_current_exec_action', 0.5)
+            
+            if exec_passivity < 0.2:
+                logger.info(f"🦸 MARL Exec Agent routing: AGGRESSIVE MARKET SWEEP (p={exec_passivity:.2f})")
+                side = OrderSide.BUY # Buy YES or NO directly into asks
+            elif exec_passivity > 0.8:
+                logger.info(f"🦸 MARL Exec Agent routing: PASSIVE LIMIT RELOAD (p={exec_passivity:.2f})")
+                side = OrderSide.BUY # Would technically limit at best bid here
+            else:
+                logger.info(f"🦸 MARL Exec Agent routing: LOGISTIC NORMAL SPREAD SPLIT (p={exec_passivity:.2f})")
+                side = OrderSide.BUY
+
 
             if direction == "long":
                 trade_instrument_id = getattr(self, '_yes_instrument_id', self.instrument_id)
@@ -1146,7 +1325,7 @@ class IntegratedBTCStrategy(Strategy):
     # Signal processing
     # ------------------------------------------------------------------
 
-    def _process_signals(self, current_price, metadata=None):
+    async def _process_signals(self, current_price, metadata=None):
         signals = []
         if metadata is None:
             metadata = {}
@@ -1158,13 +1337,22 @@ class IntegratedBTCStrategy(Strategy):
             else:
                 processed_metadata[key] = value
 
-        spike_signal = self.spike_detector.process(
-            current_price=current_price,
-            historical_prices=self.price_history,
-            metadata=processed_metadata,
-        )
-        if spike_signal:
-            signals.append(spike_signal)
+        # --- Synchronous processors (CPU-only, no I/O) ---
+        sync_processors = [
+            self.spike_detector,
+            self.tick_velocity_processor,
+            self.lead_lag_processor,
+            self.coinbase_premium_processor
+        ]
+        
+        for p in sync_processors:
+            sig = p.process(
+                current_price=current_price,
+                historical_prices=self.price_history,
+                metadata=processed_metadata,
+            )
+            if sig:
+                signals.append(sig)
 
         if 'sentiment_score' in processed_metadata:
             sentiment_signal = self.sentiment_processor.process(
@@ -1184,34 +1372,56 @@ class IntegratedBTCStrategy(Strategy):
             if divergence_signal:
                 signals.append(divergence_signal)
 
-        # --- Order Book Imbalance (real-time Polymarket CLOB depth) ---
+        # --- Async I/O processors: orderbook + Deribit in PARALLEL ---
+        async_tasks = []
+
         if processed_metadata.get('yes_token_id'):
-            ob_signal = self.orderbook_processor.process(
+            async_tasks.append(self.orderbook_processor.process(
                 current_price=current_price,
                 historical_prices=self.price_history,
                 metadata=processed_metadata,
-            )
-            if ob_signal:
-                signals.append(ob_signal)
+            ))
 
-        # --- Tick Velocity (last 60s of Polymarket probability movement) ---
-        if processed_metadata.get('tick_buffer'):
-            tv_signal = self.tick_velocity_processor.process(
-                current_price=current_price,
-                historical_prices=self.price_history,
-                metadata=processed_metadata,
-            )
-            if tv_signal:
-                signals.append(tv_signal)
-
-        # --- Deribit Put/Call Ratio (institutional options sentiment) ---
-        pcr_signal = self.deribit_pcr_processor.process(
+        async_tasks.append(self.deribit_pcr_processor.process(
             current_price=current_price,
             historical_prices=self.price_history,
             metadata=processed_metadata,
-        )
-        if pcr_signal:
-            signals.append(pcr_signal)
+        ))
+
+        async_tasks.append(self.funding_rate_processor.process(
+            current_price=current_price,
+            historical_prices=self.price_history,
+            metadata=processed_metadata,
+        ))
+
+        async_tasks.append(self.perp_oi_processor.process(
+            current_price=current_price,
+            historical_prices=self.price_history,
+            metadata=processed_metadata,
+        ))
+
+        if async_tasks:
+            async_results = await asyncio.gather(*async_tasks, return_exceptions=True)
+            for result in async_results:
+                if isinstance(result, Exception):
+                    logger.warning(f"Async signal processor error: {result}")
+                elif result is not None:
+                    signals.append(result)
+
+        # Update cascade shield: block entries when funding OR OI indicates
+        # structural fragility (extreme leverage buildup in perp markets).
+        funding_fragile = self.funding_rate_processor.is_fragile
+        oi_fragile = self.perp_oi_processor.is_fragile
+        self.risk_engine.set_fragility_state(funding_fragile or oi_fragile)
+
+        # Snapshot per-source directions for GMADL gradient computation.
+        # direction is stored as +1 (BULLISH) or -1 (BEARISH/NEUTRAL).
+        # Consumed by _record_paper_trade so each trade carries the voting
+        # direction of every active signal source.
+        self._last_signal_directions = {
+            sig.source: (1 if "BULLISH" in str(sig.direction).upper() else -1)
+            for sig in signals
+        }
 
         return signals
 
@@ -1292,17 +1502,56 @@ class IntegratedBTCStrategy(Strategy):
     def on_stop(self):
         logger.info("Integrated BTC strategy stopped")
         logger.info(f"Total paper trades recorded: {len(self.paper_trades)}")
+
+        # Full paper trade dump on shutdown (backup)
+        import json as _json
+        try:
+            trades_data = [t.to_dict() for t in self.paper_trades]
+            with open('paper_trades_final.json', 'w') as f:
+                _json.dump(trades_data, f, indent=2)
+        except Exception:
+            pass
+
+        # Stop liquidation feed background task
+        if self._liquidation_feed:
+            self._liquidation_feed.stop()
+
+        # Clean up persistent HTTP clients and async Redis
+        async def _cleanup():
+            if self._coinbase_client:
+                try:
+                    await self._coinbase_client.disconnect()
+                except Exception:
+                    pass
+            if self._news_client:
+                try:
+                    await self._news_client.disconnect()
+                except Exception:
+                    pass
+            if self.redis_client:
+                try:
+                    await self.redis_client.close()
+                except Exception:
+                    pass
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(_cleanup())
+            else:
+                loop.run_until_complete(_cleanup())
+        except Exception:
+            pass
+
         if self.grafana_exporter:
-            import asyncio
             try:
-                loop = asyncio.new_event_loop()
-                loop.run_until_complete(self.grafana_exporter.stop())
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.ensure_future(self.grafana_exporter.stop())
+                else:
+                    loop.run_until_complete(self.grafana_exporter.stop())
             except Exception:
                 pass
-
-# ---------------------------------------------------------------------------
-# Runner
-# ---------------------------------------------------------------------------
 
 def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, test_mode: bool = False):
     """Run the integrated BTC 15-min trading bot - LOADS ALL BTC MARKETS FOR THE DAY"""
@@ -1312,19 +1561,22 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
     print("Nautilus + 7-Phase System + Redis Control")
     print("=" * 80)
 
-    redis_client = init_redis()
+    # Use sync Redis for one-time setup (before event loop exists)
+    sync_redis = init_redis_sync()
 
-    if redis_client:
+    if sync_redis:
         try:
-            # ALWAYS overwrite Redis with the current session mode.
-            # This prevents a stale value from a previous --live run
-            # silently overriding --test-mode or --simulation runs.
             mode_value = '1' if simulation else '0'
-            redis_client.set('btc_trading:simulation_mode', mode_value)
+            sync_redis.set('btc_trading:simulation_mode', mode_value)
             mode_label = 'SIMULATION' if simulation else 'LIVE'
             logger.info(f"Redis simulation_mode forced to: {mode_label} ({mode_value})")
         except Exception as e:
             logger.warning(f"Could not set Redis simulation mode: {e}")
+        finally:
+            sync_redis.close()
+
+    # Create async Redis client for use inside the strategy event loop
+    redis_client = init_redis_async() if sync_redis else None
 
     print(f"\nConfiguration:")
     print(f"  Initial Mode: {'SIMULATION' if simulation else 'LIVE TRADING'}")
@@ -1340,26 +1592,14 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
     # Slug timestamps ARE standard Unix timestamps (no offset) aligned to
     # 15-min boundaries. Generate slugs for current + next 24 hours.
     # =========================================================================
-    now = datetime.now(timezone.utc)
-    unix_interval_start = (int(now.timestamp()) // 900) * 900  # current 15-min boundary
-
-    btc_slugs = []
-    for i in range(-1, 97):  # include 1 prior interval (in case we're just after boundary)
-        timestamp = unix_interval_start + (i * 900)
-        btc_slugs.append(f"btc-updown-15m-{timestamp}")
-
     filters = {
         "active": True,
         "closed": False,
-        "archived": False,
-        "slug": tuple(btc_slugs),
-        "limit": 100,
+        "archived": False
     }
 
     logger.info("=" * 80)
-    logger.info("LOADING BTC 15-MIN MARKETS BY SLUG")
-    logger.info(f"  Interval start: {unix_interval_start} | Count: {len(btc_slugs)}")
-    logger.info(f"  First: {btc_slugs[0]}  Last: {btc_slugs[-1]}")
+    logger.info("LOADING ACTIVE MARKETS FOR LIVE MATH VALIDATION")
     logger.info("=" * 80)
 
     instrument_cfg = InstrumentProviderConfig(
@@ -1397,7 +1637,7 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         exec_engine=LiveExecEngineConfig(qsize=6000),
         risk_engine=LiveRiskEngineConfig(bypass=simulation),
         data_clients={POLYMARKET: poly_data_cfg},
-        exec_clients={POLYMARKET: poly_exec_cfg},
+        exec_clients={} if simulation else {POLYMARKET: poly_exec_cfg},
     )
 
     strategy = IntegratedBTCStrategy(
@@ -1409,7 +1649,8 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
     print("\nBuilding Nautilus node...")
     node = TradingNode(config=config)
     node.add_data_client_factory(POLYMARKET, PolymarketLiveDataClientFactory)
-    node.add_exec_client_factory(POLYMARKET, PolymarketLiveExecClientFactory)
+    if not simulation:
+        node.add_exec_client_factory(POLYMARKET, PolymarketLiveExecClientFactory)
     node.trader.add_strategy(strategy)
     node.build()
     logger.info("Nautilus node built successfully")

@@ -7,7 +7,14 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 from enum import Enum
+from enum import Enum
 from loguru import logger
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from core.math.kce_avellaneda import OptimalPositionSizer
+from core.math.psr import ProbabilisticSharpeRatio
 
 
 class RiskLevel(Enum):
@@ -81,9 +88,19 @@ class RiskEngine:
         # Track daily statistics
         self._daily_pnl = Decimal("0")
         self._daily_trades = 0
+        self._daily_trades = 0
         self._peak_balance = Decimal("1000.0")  # Starting balance
         self._current_balance = Decimal("1000.0")
         
+        # 2026 SOTA Dynamic Sizing & Analytics
+        self.kce_sizer = OptimalPositionSizer(max_leverage=self.limits.max_leverage, half_life=0.5, risk_aversion=0.1)
+        self.psr_calc = ProbabilisticSharpeRatio(benchmark_sharpe=0.0, periods_per_year=35040)
+        self._historical_returns: List[float] = []
+
+        # Cascade shield: set by derivatives processors (funding rate + OI)
+        # When True, all new position entries are blocked until the regime clears.
+        self._cascade_fragile: bool = False
+
         # Alerts
         self._alerts: List[Dict[str, Any]] = []
         
@@ -93,6 +110,23 @@ class RiskEngine:
             f"max_exposure=${self.limits.max_total_exposure}"
         )
     
+    def set_fragility_state(self, fragile: bool) -> None:
+        """
+        Update structural fragility flag from derivatives processors.
+
+        Called by bot._process_signals after FundingRateProcessor and
+        PerpOIChangeProcessor run. When True, all new position entries are
+        blocked until the regime clears (cascade shield).
+
+        Args:
+            fragile: True when funding rate and/or OI indicate extreme
+                     leverage buildup and cascade risk.
+        """
+        if fragile != self._cascade_fragile:
+            status = "ACTIVE" if fragile else "cleared"
+            logger.warning(f"Cascade shield: {status}")
+        self._cascade_fragile = fragile
+
     def validate_new_position(
         self,
         size: Decimal,
@@ -101,15 +135,23 @@ class RiskEngine:
     ) -> tuple[bool, Optional[str]]:
         """
         Validate if new position is allowed.
-        
+
         Args:
             size: Position size in USD
             direction: "long" or "short"
             current_price: Current market price
-            
+
         Returns:
             (is_valid, error_message)
         """
+        # Cascade shield: block entries during structural fragility regimes.
+        # Triggered when derivatives processors detect extreme funding + OI.
+        if self._cascade_fragile:
+            return False, (
+                "Cascade shield active: structural fragility detected "
+                "(extreme funding rate or OI surge) — entry blocked"
+            )
+
         # Check position size limit ($1 max)
         if size > self.limits.max_position_size:
             return False, f"Position size ${size} exceeds max ${self.limits.max_position_size}"
@@ -158,25 +200,39 @@ class RiskEngine:
             Position size in USD (capped at $1.00)
         """
         # Base position size (% of capital)
-        risk_amount = self._current_balance * Decimal(str(risk_percent))
+        # Map legacy confidence parameters to KCE implied probability
+        # In highly efficient Polymarket regimes, confidence translates directly
+        # to the probability of the outcome resolving in our direction.
+        win_prob = signal_confidence * (signal_score / 100.0)
         
-        # Scale by signal strength
-        strength_multiplier = Decimal(str(signal_confidence)) * Decimal(str(signal_score / 100))
+        # Polymarket binary options usually mean we risk $P to make $(1-P).
+        # We approximate W/L as 1.0 for the baseline scaler, allowing KCE to
+        # modulate solely on edge probability.
+        w_l_ratio = 1.0 
         
-        # Calculate position size
-        position_size = risk_amount * strength_multiplier
+        current_inventory = float(self.get_total_exposure())
+        current_bankroll = float(self._current_balance)
         
-        # ENFORCE $1 MAXIMUM
-        if position_size > Decimal("1.0"):
-            logger.info(f"Capping position size from ${float(position_size):.2f} to $1.00")
-            position_size = Decimal("1.0")
+        optimal_usd = self.kce_sizer.calculate_size(
+            current_bankroll=current_bankroll,
+            win_prob=win_prob,
+            win_loss_ratio=w_l_ratio,
+            current_inventory=current_inventory
+        )
         
-        # Ensure at least $1 (for simulation, in live you might want higher minimum)
+        position_size = Decimal(str(max(0.0, optimal_usd)))
+        
+        # ENFORCE MAXIMUM LIMITS
+        if position_size > self.limits.max_position_size:
+            logger.info(f"Capping KCE position size from ${float(position_size):.2f} to max allowed ${self.limits.max_position_size}")
+            position_size = self.limits.max_position_size
+        
+        # Ensure at least $1 (Polymarket minimum usually)
         position_size = max(position_size, Decimal("1.0"))
         
         logger.info(
-            f"Calculated position size: ${position_size:.2f} "
-            f"(confidence={signal_confidence:.2%}, score={signal_score:.1f})"
+            f"Calculated KCE position size: ${position_size:.2f} "
+            f"(implied_prob={win_prob:.2%}, inventory=${current_inventory:.2f})"
         )
         
         return position_size
@@ -311,6 +367,9 @@ class RiskEngine:
         self._current_balance += realized_pnl
         self._daily_pnl += realized_pnl
         
+        # Track return for PSR Edge Validation
+        self._historical_returns.append(float(pnl_pct))
+        
         # Update peak balance
         if self._current_balance > self._peak_balance:
             self._peak_balance = self._current_balance
@@ -388,16 +447,21 @@ class RiskEngine:
         if self._peak_balance == 0:
             return 0.0
         
-        drawdown = (self._peak_balance - self._current_balance) / self._peak_balance
-        return float(drawdown)
-    
     def get_risk_summary(self) -> Dict[str, Any]:
         """Get comprehensive risk summary."""
+        ann_sr, prob, is_sig = self.psr_calc.calculate_psr(self._historical_returns)
+        
         return {
             "timestamp": datetime.now(),
             "positions": {
                 "count": len(self._positions),
                 "max_allowed": self.limits.max_positions,
+            },
+            "analytics": {
+                "annualized_sharpe": float(ann_sr),
+                "psr_probability": float(prob),
+                "psr_significant": is_sig,
+                "trades_count": len(self._historical_returns)
             },
             "exposure": {
                 "current": float(self.get_total_exposure()),
@@ -412,7 +476,7 @@ class RiskEngine:
             "balance": {
                 "current": float(self._current_balance),
                 "peak": float(self._peak_balance),
-                "drawdown_pct": self.get_current_drawdown() * 100,
+                "drawdown_pct": float(self.get_current_drawdown() or 0.0) * 100,
                 "max_drawdown_pct": self.limits.max_drawdown_pct * 100,
             },
             "daily_stats": {

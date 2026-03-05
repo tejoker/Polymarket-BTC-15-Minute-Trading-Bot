@@ -35,6 +35,8 @@ import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
+from core.math.sigmoid import calculate_sigmoid_confidence
+
 
 from core.strategy_brain.signal_processors.base_processor import (
     BaseSignalProcessor,
@@ -144,7 +146,16 @@ class PriceDivergenceProcessor(BaseSignalProcessor):
             # strongly confirms the move.
             if spot_momentum <= 0.001:  # momentum not strongly confirming Up
                 extremeness = (poly_prob - self.extreme_prob_threshold) / (1.0 - self.extreme_prob_threshold)
-                confidence = min(0.80, self.min_confidence + extremeness * 0.25)
+                
+                # 2026 SOTA Replace linear clamp with non-linear Sigmoid scale
+                confidence = calculate_sigmoid_confidence(
+                    extremeness=extremeness,
+                    steepness=6.0,
+                    midpoint=0.4,
+                    max_confidence=0.85,
+                    min_confidence_floor=self.min_confidence
+                )
+                
                 strength = SignalStrength.STRONG if extremeness > 0.5 else SignalStrength.MODERATE
 
                 signal = TradingSignal(
@@ -172,9 +183,18 @@ class PriceDivergenceProcessor(BaseSignalProcessor):
 
         elif poly_prob <= self.low_prob_threshold:
             # Market >68% confident BTC goes Down — fade to UP unless momentum confirms
-            if spot_momentum >= -0.001:  # not strongly falling
+            if spot_momentum >= -0.001:  # momentum not strongly confirming Down
                 extremeness = (self.low_prob_threshold - poly_prob) / self.low_prob_threshold
-                confidence = min(0.80, self.min_confidence + extremeness * 0.25)
+                
+                # 2026 SOTA Replace linear clamp with non-linear Sigmoid scale
+                confidence = calculate_sigmoid_confidence(
+                    extremeness=extremeness,
+                    steepness=6.0,
+                    midpoint=0.4,
+                    max_confidence=0.85,
+                    min_confidence_floor=self.min_confidence
+                )
+                
                 strength = SignalStrength.STRONG if extremeness > 0.5 else SignalStrength.MODERATE
 
                 signal = TradingSignal(

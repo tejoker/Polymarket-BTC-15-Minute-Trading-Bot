@@ -12,7 +12,10 @@ from loguru import logger
 import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
+from core.math.ftrl import FTRLProximal
+from core.math.gmadl import compute_source_gradient
 from monitoring.performance_tracker import get_performance_tracker, Trade
 from core.strategy_brain.fusion_engine.signal_fusion import get_fusion_engine
 
@@ -67,6 +70,9 @@ class LearningEngine:
         
         # Learning history
         self._weight_adjustments: List[Dict[str, Any]] = []
+        
+        # 2026 SOTA FTRL-Proximal Optimizer
+        self.ftrl = FTRLProximal(alpha=self.learning_rate)
         
         logger.info(
             f"Initialized Learning Engine "
@@ -150,48 +156,88 @@ class LearningEngine:
         performances: Dict[str, SignalPerformance],
     ) -> Dict[str, float]:
         """
-        Calculate optimal weights based on performance.
-        
-        Args:
-            performances: Signal performance metrics
-            
-        Returns:
-            Optimized weights per signal source
+        Calculate optimal weights using GMADL-weighted FTRL gradients.
+
+        For each signal source, attempts to build (r_t, y_hat_t) pairs from
+        trade metadata and compute a GMADL gradient that magnitude-weights the
+        directional accuracy of the signal.
+
+        GMADL gradient interpretation:
+          - Negative gradient → signal performed well on large moves → weight boosted
+          - Positive gradient → signal was wrong on large moves → weight suppressed
+          - Small-magnitude moves contribute near-zero gradient → noise filtered
+
+        Falls back to the original flat win-rate / PnL gradient for sources that
+        lack per-trade direction metadata (trades recorded before this upgrade).
         """
-        # Simple approach: Weight by win rate and total P&L
-        weights = {}
-        
+        # Fetch individual trades once for GMADL pair construction.
+        # The per-source aggregate (performances) doesn't carry per-trade direction.
+        recent_trades = self.performance.get_trade_history(limit=500)
+
         for source, perf in performances.items():
-            # Skip if not enough trades
             if perf.total_trades < self.min_trades:
-                weights[source] = self.fusion.weights.get(source, 0.1)
                 continue
+
+            # Build (realized_return, predicted_score) pairs for GMADL.
+            #
+            # r_t   = BTC-frame return: pnl_pct for LONG, -pnl_pct for SHORT.
+            #         Positive when BTC went up, negative when BTC went down.
+            # y_hat = direction_sign × avg_confidence.
+            #         Encodes both the direction the source voted and how strongly.
+            trade_pairs = []
+            for trade in recent_trades:
+                dirs = trade.metadata.get("signal_directions", {})
+                if source not in dirs:
+                    continue  # This trade predates GMADL tracking
+
+                direction_sign = dirs[source]  # +1 BULLISH, -1 BEARISH
+
+                # Convert trade return to BTC-frame (unsigned by trade direction)
+                if trade.direction == "long":
+                    r_t = trade.pnl_pct  # positive if BTC went up
+                else:
+                    r_t = -trade.pnl_pct  # short: pnl_pct positive = BTC went down
+
+                y_hat = direction_sign * perf.avg_confidence
+                trade_pairs.append((r_t, y_hat))
+
+            if trade_pairs:
+                # GMADL magnitude-weighted directional gradient
+                total_gradient = compute_source_gradient(
+                    trade_pairs, k=10.0, p=1.0
+                )
+                logger.debug(
+                    f"GMADL gradient [{source}]: {total_gradient:.5f} "
+                    f"({len(trade_pairs)} directional trades)"
+                )
+            else:
+                # Fallback: original flat win-rate / PnL gradient.
+                # Used for sources without per-trade direction data (old trades).
+                win_rate_loss = 0.50 - perf.win_rate
+                pnl_loss = -float(perf.total_pnl) / 100.0
+                total_gradient = (win_rate_loss * 0.6) + (pnl_loss * 0.4)
+                logger.debug(
+                    f"Fallback gradient [{source}]: {total_gradient:.5f} "
+                    f"(no GMADL trades yet — using win-rate/PnL)"
+                )
+
+            # Step the FTRL optimizer
+            self.ftrl.update(source, total_gradient)
             
-            # Calculate performance score
-            # Combines win rate and profitability
-            win_rate_score = perf.win_rate
-            pnl_score = min(1.0, max(0.0, float(perf.total_pnl / Decimal("100"))))
-            
-            # Weighted combination
-            performance_score = (win_rate_score * 0.6) + (pnl_score * 0.4)
-            
-            # Apply learning rate (gradual adjustment)
-            current_weight = self.fusion.weights.get(source, 0.1)
-            target_weight = performance_score
-            
-            new_weight = current_weight + (target_weight - current_weight) * self.learning_rate
-            
-            # Clamp to reasonable range
-            new_weight = max(0.05, min(0.50, new_weight))
-            
-            weights[source] = new_weight
+        feature_ids = list(performances.keys())
         
-        # Normalize weights to sum to 1.0
-        total = sum(weights.values())
-        if total > 0:
-            weights = {k: v / total for k, v in weights.items()}
+        # Ensure all existing features have at least a baseline if unseen
+        for source in self.fusion.weights.keys():
+            if source not in feature_ids:
+                feature_ids.append(source)
+                
+        new_weights = self.ftrl.get_normalized_weights(feature_ids)
         
-        return weights
+        # In case FTRL collapses to zero for everything, maintain defaults
+        if not new_weights:
+            return self.fusion.weights.copy()
+            
+        return new_weights
     
     async def optimize_weights(self) -> Dict[str, float]:
         """

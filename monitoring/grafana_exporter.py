@@ -314,17 +314,17 @@ class GrafanaMetricsExporter:
             perf_metrics = self.performance.calculate_metrics()
             
             # Update gauges
-            self.total_pnl.set(float(perf_metrics.total_pnl))
-            self.roi.set(perf_metrics.roi * 100)
-            self.win_rate.set(perf_metrics.win_rate * 100)
-            self.sharpe_ratio.set(perf_metrics.sharpe_ratio)
-            self.max_drawdown.set(perf_metrics.max_drawdown * 100)
+            self.total_pnl.set(float(perf_metrics.total_pnl or 0.0))
+            self.roi.set(float(perf_metrics.roi or 0.0) * 100)
+            self.win_rate.set(float(perf_metrics.win_rate or 0.0) * 100)
+            self.sharpe_ratio.set(float(perf_metrics.sharpe_ratio or 0.0))
+            self.max_drawdown.set(float(perf_metrics.max_drawdown or 0.0) * 100)
             
-            self.open_positions.set(perf_metrics.open_positions)
-            self.total_exposure.set(float(perf_metrics.total_exposure))
+            self.open_positions.set(perf_metrics.open_positions or 0)
+            self.total_exposure.set(float(perf_metrics.total_exposure or 0.0))
             
-            self.avg_signal_score.set(perf_metrics.avg_signal_score)
-            self.avg_signal_confidence.set(perf_metrics.avg_signal_confidence)
+            self.avg_signal_score.set(float(perf_metrics.avg_signal_score or 0.0))
+            self.avg_signal_confidence.set(float(perf_metrics.avg_signal_confidence or 0.0))
             
             self.current_capital.set(float(self.performance.current_capital))
             
@@ -346,7 +346,8 @@ class GrafanaMetricsExporter:
             logger.debug("Metrics updated successfully")
             
         except Exception as e:
-            logger.error(f"Error updating metrics: {e}")
+            import traceback
+            logger.error(f"Error updating metrics: {e}\n{traceback.format_exc()}")
     
     async def start(self) -> None:
         """Start metrics server and update loop."""
